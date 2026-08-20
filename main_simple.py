@@ -474,16 +474,28 @@ class DigitMatcher:
               f"({total} 数字模板 + {sym_total} 符号模板)")
 
     @staticmethod
-    def _top_bar_density(bin_img):
-        """顶部 25% 区域白色像素占比（5 有平顶横杠≈0.6+，6 顶部开口≈0.3）"""
+    def _top_bar_stripe(bin_img):
+        """顶部横杠判别：最顶 2 行「最大连续白段占比」的均值。
+        5 的顶杠满宽且在第 1 行就出现（≈0.6+），6 顶部是开口弧线
+        顶端（≈0.45-，且逐行递增），抗 arial/粗体/衬线字体干扰。"""
         ys, xs = np.where(bin_img > 0)
         if len(xs) == 0:
             return 0.0
-        y0, y1 = ys.min(), ys.max()
-        top = bin_img[y0:int(y0 + (y1 - y0) * 0.25), :]
-        if top.size == 0:
-            return 0.0
-        return float((top > 0).sum()) / top.size
+        y0 = ys.min()
+        w = bin_img.shape[1]
+        vals = []
+        for row in bin_img[y0:y0 + 2, :]:
+            r = row > 0
+            if not r.any():
+                vals.append(0.0)
+                continue
+            mx = 0
+            cur = 0
+            for v in r:
+                cur = cur + 1 if v else 0
+                mx = max(mx, cur)
+            vals.append(mx / w)
+        return float(np.mean(vals)) if vals else 0.0
 
     def classify(self, roi):
         """
@@ -556,7 +568,7 @@ class DigitMatcher:
         d2, s2 = scored[1]
         # 5/6 并列判别：5 有平顶横杠，6 顶部开口
         if {d1, d2} == {"5", "6"} and (s1 - s2) < 0.08:
-            return ('digit', ("5" if self._top_bar_density(norm) >= 0.45 else "6"),
+            return ('digit', ("5" if self._top_bar_stripe(norm) >= 0.55 else "6"),
                     max(s1, s2))
         return ('digit', d1, s1)
 
