@@ -301,8 +301,8 @@ class MouseDrawer:
         '1': [[(0.50, 0.15), (0.50, 0.85)]],
         '2': [[(0.75, 0.15), (0.25, 0.15), (0.75, 0.50),
                (0.25, 0.85), (0.80, 0.85)]],
-        '3': [[(0.70, 0.15), (0.30, 0.25), (0.68, 0.50)],
-              [(0.68, 0.50), (0.30, 0.75), (0.70, 0.85)]],
+        '3': [[(0.25, 0.35), (0.75, 0.18), (0.30, 0.50)],
+              [(0.30, 0.50), (0.75, 0.82), (0.25, 0.85)]],
         '4': [[(0.65, 0.15), (0.22, 0.55), (0.72, 0.55)],
               [(0.50, 0.20), (0.50, 0.85)]],
         '5': [[(0.70, 0.15), (0.25, 0.15), (0.25, 0.50)],
@@ -634,7 +634,7 @@ class DigitMatcher:
 # ============================================================
 
 class OCREngine:
-    def __init__(self, confidence=0.62):
+    def __init__(self, confidence=0.60):
         # 0.62: 真实数字最低 0.63（18px 小字），而 ? x × 等符号最高 0.58，安全分界
         self.confidence = confidence
         self.matcher = DigitMatcher()
@@ -681,86 +681,97 @@ class OCREngine:
         """
         识别算式/等式并解答，返回 (答案, 题目文本) 或 None。
 
-        支持两类题型:
-          直接计算: "3 + 4"         → (7, "3 + 4")
-          求未知数: "? + 3 = 5"    → (2, "? + 3 = 5")
-                    "5 - ? = 2"    → (3, "5 - ? = 2")
-                    "3 + 4 = ?"    → (7, "3 + 4 = ?")
-                    "6 × ? = 12"   → (2, "6 × ? = 12")
-                    "12 ÷ ? = 3"   → (4, "12 ÷ ? = 3")
-        未知数可在 被加数/加数/结果 任意位置；无法识别、无解、
-        除不尽、结果为负 → 一律返回 None（不写错误答案）。
+        支持:
+          直接计算:  "3 + 4"        → (7, "3 + 4")
+                     "1 + 1 * 2"   → (3, "1 + 1 * 2")   多运算符按先乘除后加减
+          求未知数:  "? + 3 = 5"   → (2, "? + 3 = 5")
+                     "5 - ? = 2"   → (3, "5 - ? = 2")
+                     "3 + 4 = ?"   → (7, "3 + 4 = ?")
+                     "1 * ? = 3"   → (3, "1 * ? = 3")
+                     "1 + 1 * 2 = ?" → (3, "1 + 1 * 2 = ?")
+        未知数可在任意操作数或结果位置；无法识别、无解、除不尽、
+        结果为负 → 一律返回 None（不写错误答案）。
         """
         binary = self.preprocess(image)
         items, symbols = self._detect(binary)
 
-        ops = [s for s in symbols if s[4] in self.OP_MAP]
-        if not ops:
+        # 数字 token（按间距分组，x 中心）
+        num_tokens = self._group_items(items)
+        # 运算符 token
+        op_tokens = [(s[0] + s[2] / 2, s[4])
+                     for s in symbols if s[4] in self.OP_MAP]
+        if not op_tokens:
             return None
-        op_sym = max(ops, key=lambda s: s[5])
-        op_x = op_sym[0] + op_sym[2] / 2
-        op = self.OP_MAP[op_sym[4]]
-        op_char = self._op_display(op_sym[4])
-
+        # 等号
         eqs = [s for s in symbols if s[4] in self.EQUALS_CHARS]
-
-        # ---------- 有等号 → 等式（求未知数） ----------
+        eq_x = None
         if eqs:
-            eq_x = max(eqs, key=lambda s: s[5])[0]
-            eq_w = max(eqs, key=lambda s: s[5])[2]
-            eq_x += eq_w / 2
-            left = [it for it in items if it[0] + it[2] / 2 < op_x - 2]
-            mid = [it for it in items if op_x + 2 < it[0] + it[2] / 2 < eq_x - 2]
-            right = [it for it in items if it[0] + it[2] / 2 > eq_x + 2]
-            nX = self._merge_group(left)
-            nY = self._merge_group(mid)
-            nZ = self._merge_group(right)
+            eq_sym = max(eqs, key=lambda s: s[5])
+            eq_x = eq_sym[0] + eq_sym[2] / 2
+        # 问号/空框标记
+        qs = [s for s in symbols if s[4] in self.UNKNOWN_CHARS]
+        q_x = None
+        if qs:
+            q_x = sorted(s[0] + s[2] / 2 for s in qs)[len(qs) // 2]
 
-            # 未知数在哪：问号/空框位置优先，其次空槽位
-            unknown_slot = None
-            unknowns = [s for s in symbols if s[4] in self.UNKNOWN_CHARS]
-            if unknowns:
-                ux = sorted(s[0] + s[2] / 2 for s in unknowns)[len(unknowns) // 2]
-                if ux < op_x:
-                    unknown_slot = 'X'
-                elif ux < eq_x:
-                    unknown_slot = 'Y'
-                else:
-                    unknown_slot = 'Z'
-                # 问号槽位里还有数字 → 多位数未知，跳过
-                slot_val = {'X': nX, 'Y': nY, 'Z': nZ}[unknown_slot]
-                if slot_val is not None:
-                    return None
-            else:
-                if nX is None:
-                    unknown_slot = 'X'
-                elif nY is None:
-                    unknown_slot = 'Y'
-                elif nZ is None:
-                    unknown_slot = 'Z'
+        # ---------- 组装左右两侧 token 序列 ----------
+        left_tokens = []   # (kind, value) kind ∈ num/op/q
+        for xc, v in num_tokens:
+            if eq_x is not None and xc > eq_x + 2:
+                continue
+            left_tokens.append((xc, 'num', v))
+        for xc, ch in op_tokens:
+            if eq_x is not None and xc > eq_x + 2:
+                continue
+            left_tokens.append((xc, 'op', ch))
+        if q_x is not None and (eq_x is None or q_x < eq_x):
+            left_tokens.append((q_x, 'q', '?'))
+        left_tokens.sort(key=lambda t: t[0])
 
-            if unknown_slot is None:
-                return None  # 等式完整无未知数，无事可做
+        right_tokens = []  # (kind, value)
+        right_has_q = False
+        if eq_x is not None:
+            for xc, v in num_tokens:
+                if xc > eq_x + 2:
+                    right_tokens.append((xc, 'num', v))
+            if q_x is not None and q_x > eq_x:
+                right_tokens.append((q_x, 'q', '?'))
+                right_has_q = True
+            right_tokens.sort(key=lambda t: t[0])
+        right_nums = [t[2] for t in right_tokens if t[1] == 'num']
 
-            result = self._solve_equation(op, unknown_slot, nX, nY, nZ)
+        # 左侧去掉坐标，校验并补齐边界缺失操作数
+        lt = [(k, v) for _, k, v in left_tokens]
+        if not self._normalize_tokens(lt):
+            return None
+
+        has_left_q = any(k == 'q' for k, _ in lt)
+
+        # ---------- 求值/求解 ----------
+        if has_left_q:
+            # 左侧有未知数：需要 '=' 和右侧恰好一个数
+            if eq_x is None or len(right_nums) != 1:
+                return None
+            result = self._solve_unknown(lt, right_nums[0])
             if result is None:
                 return None
-            sx = '?' if unknown_slot == 'X' else str(nX)
-            sy = '?' if unknown_slot == 'Y' else str(nY)
-            sz = '?' if unknown_slot == 'Z' else str(nZ)
-            return result, f"{sx} {op_char} {sy} = {sz}"
+        else:
+            L = self._eval_tokens(lt)
+            if L is None:
+                return None
+            if eq_x is None or right_has_q or (not right_tokens):
+                # 无等号 / 右侧是问号 / 右侧空白 → 答案 = 左侧结果
+                result = L
+            elif len(right_nums) == 1:
+                if L == right_nums[0]:
+                    return None  # 等式已完整，跳过
+                return None      # 两侧不等 → 识别有问题，保守跳过
+            else:
+                return None
 
-        # ---------- 无等号 → 直接计算 ----------
-        left = [it for it in items if it[0] + it[2] / 2 < op_x - 2]
-        right = [it for it in items if it[0] + it[2] / 2 > op_x + 2]
-        n1 = self._merge_group(left)
-        n2 = self._merge_group(right)
-        if n1 is None or n2 is None:
-            return None
-        result = self.compute(n1, n2, op)
-        if result is None:
-            return None
-        return result, f"{n1} {op_char} {n2}"
+        # ---------- 拼题目文本 ----------
+        display = self._format_problem(lt, right_tokens, eq_x is not None)
+        return result, display
 
     # ---------- 轮廓检测（数字 + 符号，部件组装式，适配紧凑排版） ----------
     def _detect(self, binary):
@@ -801,6 +812,7 @@ class OCREngine:
         symbols = []  # 符号 [x, y, w, h, sym, score]
         hbars = []    # 细横条（= ÷ - 的部件）
         dots = []     # 小圆点（? ÷ 的部件）
+        blobs = []    # 数字大小的未分类块（可能是 ? 曲线等弱数字）
         for x, y, w, h, kind, value, score in raw:
             if kind == 'digit' and score >= self.confidence:
                 items.append([x, y, w, h, value])
@@ -817,17 +829,16 @@ class OCREngine:
                     hbars.append([x, y, w, h])
                 elif w <= dot_max and h <= dot_max and w >= 2:
                     dots.append([x, y, w, h])
+                elif h >= thin_max and h <= h_avg * 1.6 and w >= 4:
+                    blobs.append([x, y, w, h])  # 可能是 ? 曲线
 
-        # '?' 曲线识别：某个"数字"下方有小圆点 → 其实是 '?'
-        unknown_marks = []
-        keep = []
-        for it in items:
-            box = (it[0], it[1], it[2], it[3])
+        # '?' 曲线识别：数字/弱数字块下方有小圆点 → 其实是 '?'
+        marked = set()
+        for box in [tuple(it[:4]) for it in items] + [tuple(b) for b in blobs]:
             if any(self._is_dot_below(box, b) for b in all_boxes if b != box):
-                unknown_marks.append([it[0], it[1], it[2], it[3], '?', 0.8])
-            else:
-                keep.append(it)
-        items = keep
+                marked.add(box)
+        unknown_marks = [[x, y, w, h, '?', 0.8] for x, y, w, h in marked]
+        items = [it for it in items if (it[0], it[1], it[2], it[3]) not in marked]
 
         # 两横条上下配对 → '='
         used = set()
@@ -899,239 +910,127 @@ class OCREngine:
             return '-'
         return ch
 
+    # ---------- 表达式 token 处理 ----------
     @staticmethod
-    def _solve_equation(op, unknown_slot, nX, nY, nZ):
-        """根据未知数位置反解（n 为 None 的槽位即未知）"""
-        if op == 'add':   # X + Y = Z
-            if unknown_slot == 'X':
-                return OCREngine._check(nZ - nY) if nY is not None and nZ is not None else None
-            if unknown_slot == 'Y':
-                return OCREngine._check(nZ - nX) if nX is not None and nZ is not None else None
-            return OCREngine._check(nX + nY) if nX is not None and nY is not None else None
-        if op == 'sub':   # X - Y = Z
-            if unknown_slot == 'X':
-                return OCREngine._check(nZ + nY) if nY is not None and nZ is not None else None
-            if unknown_slot == 'Y':
-                return OCREngine._check(nX - nZ) if nX is not None and nZ is not None else None
-            return OCREngine._check(nX - nY) if nX is not None and nY is not None else None
-        if op == 'mul':   # X × Y = Z
-            if unknown_slot == 'X':
-                return OCREngine._div(nZ, nY) if nY is not None and nZ is not None else None
-            if unknown_slot == 'Y':
-                return OCREngine._div(nZ, nX) if nX is not None and nZ is not None else None
-            return OCREngine._check(nX * nY) if nX is not None and nY is not None else None
-        if op == 'div':   # X ÷ Y = Z
-            if unknown_slot == 'X':
-                return OCREngine._check(nZ * nY) if nY is not None and nZ is not None else None
-            if unknown_slot == 'Y':
-                return OCREngine._div(nX, nZ) if nX is not None and nZ is not None else None
-            return OCREngine._div(nX, nY) if nX is not None and nY is not None else None
-        return None
-
-    @staticmethod
-    def _check(v):
-        """结果必须是非负整数，否则视为无解"""
-        if v is None or v < 0:
-            return None
-        return v
-
-    @staticmethod
-    def _div(a, b):
-        """整除才返回商，否则无解"""
-        if b == 0 or a % b != 0:
-            return None
-        return a // b
-
-    @staticmethod
-    def _looks_like_division(roi):
-        """
-        判断一个被识别为 '-' 的 ROI 其实是 '÷'：
-        '÷' 上下有圆点，墨迹垂直跨度大；'-' 只有中间一条横杠。
-        """
-        h, w = roi.shape
-        if h < 12:
-            return False
-        ys, _ = np.where(roi > 0)
-        if len(ys) == 0:
-            return False
-        spread = (ys.max() - ys.min() + 1) / h
-        return spread > 0.55
-
-    @staticmethod
-    def compute(n1, n2, op):
-        """
-        计算结果（直接计算用）。
-        除法除不尽或除数为 0 返回 None（绝不写错误答案）。
-        """
-        if op == 'add':
-            return n1 + n2
-        if op == 'sub':
-            return n1 - n2
-        if op == 'mul':
-            return n1 * n2
-        if op == 'div':
-            if n2 == 0 or n1 % n2 != 0:
-                return None
-            return n1 // n2
-        return None
-
-    def _extract_by_matcher(self, binary):
-        """
-        轮廓检测 + 模板匹配，并把数字组合成两个数。
-
-        优先用【问号分隔】：题目中间必有 '?'（或其曲线/符号），
-        检测到后直接按它左右拆分，彻底防止 13?12 被读成 131>2。
-        无 '?' 时回退到间距分组。
-        """
-        contours, _ = cv2.findContours(
-            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        h_img, w_img = binary.shape[:2]
-        items = []    # 数字轮廓 [x, y, w, h, digit]
-        symbols = []  # 符号轮廓 [x, y, w, h, sym]
-        boxes = []    # 所有轮廓的框 (x, y, w, h)，含小圆点（用于 ? 检测）
-        for c in contours:
-            x, y, w, h = cv2.boundingRect(c)
-            boxes.append((x, y, w, h))
-            if w < 4 or h < 8:          # 太小
-                continue
-            if w > w_img * 0.9 or h > h_img * 0.95:  # 整行/整块（背景噪声）
-                continue
-            roi = binary[y:y + h, x:x + w]
-            kind, value, score = self.matcher.classify(roi)
-            if kind == 'digit' and score >= self.confidence:
-                items.append([x, y, w, h, value])
-            elif kind == 'symbol':
-                symbols.append([x, y, w, h, value])
-
-        # 问号曲线检测：'?' 由曲线 + 下方小圆点组成，真实数字下方没有小圆点
-        q_curves = []
-        keep = []
-        for it in items:
-            box = (it[0], it[1], it[2], it[3])
-            if any(self._is_dot_below(box, b) for b in boxes if b != box):
-                q_curves.append(it)   # 这是 '?' 的曲线，作为分隔符
-            else:
-                keep.append(it)
-        items = keep
-
-        # 分隔符位置 = 问号曲线 x 中心 + 其他符号 x 中心（取中位数）
-        seps = [it[0] + it[2] / 2 for it in q_curves]
-        seps += [s[0] + s[2] / 2 for s in symbols]
-        if seps:
-            sep_x = sorted(seps)[len(seps) // 2]
-            left = [it for it in items if it[0] + it[2] / 2 < sep_x]
-            right = [it for it in items if it[0] + it[2] / 2 >= sep_x]
-            n1 = self._merge_group(left)
-            n2 = self._merge_group(right)
-            if n1 is not None and n2 is not None:
-                return [n1, n2]
-
-        # 无问号分隔 → 回退到间距分组
-        items.sort(key=lambda t: t[0])
-        return self._group_numbers(items)
-
-    @staticmethod
-    def _merge_group(items):
-        """把一组数字轮廓按间距合并成一个整数；空则返回 None"""
-        if not items:
-            return None
+    def _group_items(items):
+        """数字轮廓 → [(x_center, 数值), ...]（按间距分组为多位数）"""
         items = sorted(items, key=lambda t: t[0])
-        text = ""
-        prev_end = None
-        prev_h = 0
-        for x, y, w, h, d in items:
-            if prev_end is not None and x - prev_end < 0.3 * min(prev_h, h):
-                text += d
-            else:
-                text += d
-            prev_end = x + w
-            prev_h = h
-        return int(text) if text.isdigit() else None
-
-    @staticmethod
-    def _is_dot_below(digit_box, other_box):
-        """
-        判断 other_box 是否是 digit_box 正下方的小圆点
-        （'?' 的圆点特征：尺寸远小于主体、位于主体下方、水平对齐）
-        """
-        dx, dy, dw, dh = digit_box
-        sx, sy, sw, sh = other_box
-        if sw <= 0 or sh <= 0:
-            return False
-        # 小圆点：尺寸远小于数字主体
-        if sw > dw * 0.45 or sh > dh * 0.45:
-            return False
-        # 位于数字主体下方（圆点顶部低于数字主体的 60% 高度处）
-        if sy < dy + dh * 0.6:
-            return False
-        # 水平对齐
-        dot_cx = sx + sw / 2
-        if abs(dot_cx - (dx + dw / 2)) > dw * 0.9:
-            return False
-        return True
-
-    @staticmethod
-    def _group_numbers(items):
-        """
-        把检测到的数字轮廓组合成数（比较题恰好两个数）。
-
-        策略:
-          1. 同一数字内相邻字符间距 < 0.3 * 字高 → 合并（如 12、26）
-          2. 若合并后仍 >= 3 组（有噪声/漏合并），在最大间距处切成 2 组
-        """
-        if not items:
-            return []
-        groups = []  # [start_x, end_x, text, height]
+        groups = []  # [start_x, end_x, text, h]
         for x, y, w, h, d in items:
             if not groups:
                 groups.append([x, x + w, d, h])
             else:
                 last = groups[-1]
-                if x - last[1] < 0.3 * min(last[3], h):
+                # 组内间距 < 0.45 × 字高 → 同一数（'12' 的 1 和 2 间隔可达 0.3×h）
+                if x - last[1] < 0.45 * min(last[3], h):
                     last[1] = x + w
                     last[2] += d
                     last[3] = max(last[3], h)
                 else:
                     groups.append([x, x + w, d, h])
+        return [((g[0] + g[1]) / 2, int(g[2])) for g in groups if g[2].isdigit()]
 
-        # 若组数 >= 3，按最大间距切成 2 组（两个数）
-        if len(groups) >= 3:
-            gaps = [groups[i][0] - groups[i - 1][1] for i in range(1, len(groups))]
-            cut = gaps.index(max(gaps))
-            left = "".join(g[2] for g in groups[:cut + 1])
-            right = "".join(g[2] for g in groups[cut + 1:])
-            groups = [left, right]
+    @staticmethod
+    def _normalize_tokens(tokens):
+        """
+        校验并补齐表达式 token 序列（就地修改）。
+        token: (kind, value)，kind ∈ {'num','op','q'}。
+        边界缺失操作数补 'q'（如 "?+3=5" 的 ? 未被识别时）。
+        返回是否合法（数字/问号与运算符交替）。
+        """
+        if not tokens:
+            return False
+        # 边界补齐
+        if tokens[0][0] == 'op':
+            tokens.insert(0, ('q', '?'))
+        if tokens[-1][0] == 'op':
+            tokens.append(('q', '?'))
+        prev = None
+        for kind, _ in tokens:
+            if kind not in ('num', 'op', 'q'):
+                return False
+            if kind == 'op':
+                if prev not in ('num', 'q'):
+                    return False
+            else:  # num / q
+                if prev in ('num', 'q'):
+                    return False  # 两操作数相邻，缺运算符
+            prev = kind
+        return tokens[-1][0] in ('num', 'q')
 
-        numbers = []
-        for g in groups:
-            text = g if isinstance(g, str) else g[2]
-            if text.isdigit():
-                numbers.append(int(text))
-        return numbers
-
-    def _extract_by_tesseract(self, image):
+    @staticmethod
+    def _eval_tokens(tokens):
+        """
+        计算 token 表达式（无 'q'）。按先乘除后加减的优先级。
+        运算符为原始字符（+ - × ÷ 及变体）。除不尽/除 0 → None。
+        """
         try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            pil_img = Image.fromarray(gray)
-            cfg = r'--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789'
-            data = pytesseract.image_to_data(
-                pil_img, config=cfg, output_type=pytesseract.Output.DICT
-            )
-            items = []
-            for i, text in enumerate(data["text"]):
-                t = text.strip()
-                if t.isdigit() and int(data["conf"][i]) >= self.confidence * 100:
-                    items.append((data["left"][i], t))
-            items.sort(key=lambda v: v[0])
-            return [int(t) for _, t in items]
+            nums = [v for k, v in tokens if k == 'num']
+            ops = [v for k, v in tokens if k == 'op']
+            if any(k == 'q' for k, _ in tokens):
+                return None
+            if len(nums) != len(ops) + 1:
+                return None
+            # 第一遍：× ÷ 立即合并，+ - 压栈
+            stack = [nums[0]]
+            for op, n in zip(ops, nums[1:]):
+                if op in ('×', '*', 'x', 'X'):        # 乘
+                    stack[-1] = stack[-1] * n
+                elif op in ('÷', '/'):                # 除
+                    if n == 0 or stack[-1] % n != 0:
+                        return None
+                    stack[-1] = stack[-1] // n
+                else:                                 # 加 / 减
+                    stack.append('+' if op in ('+', '＋') else '-')
+                    stack.append(n)
+            # 第二遍：从左到右 + -
+            result = stack[0]
+            i = 1
+            while i < len(stack):
+                op, n = stack[i], stack[i + 1]
+                result = result + n if op == '+' else result - n
+                i += 2
+            return result
         except Exception:
-            return []
+            return None
 
+    @staticmethod
+    def _solve_unknown(tokens, target):
+        """
+        求含一个 '?' 的表达式：f(?) = target。
+        用 0~200 的候选值暴力求值（覆盖整除、混合优先级等情况）。
+        """
+        if sum(1 for k, _ in tokens if k == 'q') != 1:
+            return None
+        for x in range(0, 201):
+            t2 = [('num', x) if k == 'q' else (k, v) for k, v in tokens]
+            if OCREngine._eval_tokens(t2) == target:
+                return x
+        return None
 
-# ============================================================
-#  屏幕捕获
-# ============================================================
+    @staticmethod
+    def _format_problem(left_tokens, right_tokens, has_eq):
+        """拼题目文本（未知数显示为 ?）。right_tokens 可为 (xc,kind,val) 3元组"""
+        parts = []
+        for kind, val in left_tokens:
+            if kind == 'q':
+                parts.append('?')
+            elif kind == 'op':
+                parts.append(OCREngine._op_display(val))
+            else:
+                parts.append(str(val))
+        s = ' '.join(parts)
+        if has_eq:
+            r = []
+            for t in right_tokens:
+                kind = t[1] if len(t) == 3 else t[0]
+                val = t[2] if len(t) == 3 else t[1]
+                if kind == 'q':
+                    r.append('?')
+                else:
+                    r.append(str(val))
+            s += ' = ' + ' '.join(r) if r else ' = ?'
+        return s
 
 class ScreenCapture:
     def __init__(self):
@@ -1433,7 +1332,7 @@ class ScreenCompareApp:
         self.locked = bool(self.config.get("locked", False))
 
         self.screen_capture = ScreenCapture()
-        self.ocr_engine = OCREngine(confidence=0.62)
+        self.ocr_engine = OCREngine(confidence=0.60)
         self.mouse_drawer = MouseDrawer()
         self.hotkey = GlobalHotkey(vk_code=HOTKEY_VK, on_press=self._on_hotkey)
 
