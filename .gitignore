@@ -1,0 +1,10 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 用户位置配置（运行时自动生成，含个人屏幕位置，不入库）
+config.json
+
+# IDE
+.vscode/
+.idea/
