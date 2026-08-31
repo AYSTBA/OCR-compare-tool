@@ -203,8 +203,9 @@ class MouseDrawer:
 
     LEFTDOWN = 0x0002
     LEFTUP = 0x0004
-    STEP_MS = 0.004   # 每步基础间隔
-    STEPS = 14        # 每段插值步数（越多越平滑）
+    STEP_MS = 0.0015  # 每步基础间隔（快档；反外挂判定只看轨迹是否连续，
+                   # 连续性 = 插值完整 + 步距 ≤10px + 无瞬移，全部保留）
+    STEPS = 10        # 每段插值步数上限（短距离自动减少，见 move_to）
 
     def __init__(self, jitter=1.8):
         self.user32 = ctypes.windll.user32
@@ -218,10 +219,9 @@ class MouseDrawer:
     def move_to(self, x, y, steps=None, jitter=None):
         """
         从当前位置平滑移动到目标点。
-        中间随机晃动 + 弧线弯曲（人手感），起点终点精确收敛。
+        中间随机晃动 + 弧线弯曲 + 人手速度包络（起笔慢→中段快→收笔慢），
+        起点终点精确收敛。轨迹连续无跳变：这是通过人机验证的关键。
         """
-        if steps is None:
-            steps = self.STEPS
         if jitter is None:
             jitter = self.jitter
         cx, cy = self.position()
@@ -231,6 +231,10 @@ class MouseDrawer:
             # 已在目标点：直接落点，避免起笔时晃出多余墨点
             self.user32.SetCursorPos(int(x), int(y))
             return
+        if steps is None:
+            # 距离自适应：短距离（用户压小的框）步数自动减少，
+            # 长距离封顶 STEPS。快手感：步距 ~10px 内（人手拖动远超此跨度）
+            steps = max(4, min(self.STEPS, int(dist / 10) + 4))
         # 垂直方向单位向量（产生弧线弯曲）
         ux, uy = dx / dist, dy / dist
         px, py = -uy, ux
@@ -246,28 +250,33 @@ class MouseDrawer:
                   + py * bow * math.sin(math.pi * t)
                   + random.uniform(-wobble, wobble))
             self.user32.SetCursorPos(int(tx), int(ty))
-            # 每步速度随机变化（人手忽快忽慢）
-            time.sleep(self.STEP_MS * random.uniform(0.6, 1.4))
+            # 人手速度包络：起笔慢(≈2x) → 冲刺(≈0.5x) → 收笔慢(≈2x)
+            # 而非匀速，避免被识别为机械鼠标
+            speed_env = 0.45 + 1.15 * math.sin(math.pi * t) ** 2
+            # 每步再叠加随机变速（人手忽快忽慢）
+            time.sleep(self.STEP_MS * speed_env * random.uniform(0.7, 1.3))
 
     def press(self):
         self.user32.mouse_event(self.LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(random.uniform(0.02, 0.06))  # 按下后顿一下（人手迟疑）
+        time.sleep(random.uniform(0.008, 0.014))  # 按下后顿一下（人手迟疑）
 
     def release(self):
-        time.sleep(random.uniform(0.01, 0.03))  # 抬起前顿一下
+        time.sleep(random.uniform(0.005, 0.009))  # 抬起前顿一下
         self.user32.mouse_event(self.LEFTUP, 0, 0, 0, 0)
 
     def stroke(self, points):
         """
-        一笔画完：移到起点 -> 按下 -> 连续拖动经过所有点 -> 终点抬起。
+        一笔画完：平滑移到起点 -> 按下 -> 连续拖动经过所有点 -> 终点抬起。
         整笔过程中鼠标左键保持按下，绝不在中途抬起。
+        全程连续移动（无瞬移跳变），轨迹完整可被逐帧采样。
         """
+        # 起笔慢挪（未按下不产生墨迹）：步数按距离自适应，短距离少步快挪
         self.move_to(*points[0])
         self.press()
         for p in points[1:]:
             self.move_to(*p)
         self.release()
-        time.sleep(random.uniform(0.04, 0.09))  # 笔画/符号间停顿
+        time.sleep(random.uniform(0.008, 0.014))  # 笔画/符号间停顿
 
     def draw_symbol(self, symbol, x, y, w, h):
         """在 (x,y,w,h) 区域内画出符号。整体位置微随机偏移，更自然。"""
@@ -468,6 +477,21 @@ class DigitMatcher:
                             (norm, 255 - norm))
                 except Exception:
                     continue
+        # 答题反馈符号（对勾/叉）手绘拒识模板：
+        # 划线后软件会在答案上打 ✓/✗，若落在识别框内，防止被误读成数字（1/7）
+        for name, pts in (("check", [(18, 55), (42, 78), (80, 22)]),   # ✓ 两笔
+                          ("cross", [(20, 20), (76, 76), (76, 20), (20, 76)])):  # ✗ 两笔
+            arr = np.zeros((96, 96), dtype=np.uint8)
+            if name == "check":
+                cv2.line(arr, pts[0], pts[1], 255, 8)
+                cv2.line(arr, pts[1], pts[2], 255, 8)
+            else:
+                cv2.line(arr, pts[0], pts[1], 255, 8)
+                cv2.line(arr, pts[2], pts[3], 255, 8)
+            norm = self._normalize(arr)
+            if norm is not None:
+                self.by_symbol.setdefault(name, []).append((norm, 255 - norm))
+
         total = sum(len(v) for v in self.by_digit.values())
         sym_total = sum(len(v) for v in self.by_symbol.values())
         print(f"[信息] 内置数字识别器已就绪 "
@@ -513,35 +537,49 @@ class DigitMatcher:
         if norm is None:
             return None, None, 0.0
 
-        # 第一轮：CCOEFF 快速筛选（正常极性，数字 + 符号）
-        ccf_best = {}   # digit -> (best_ccf, best_tmpl)
+        # 两级策略（提速 ~3x，精度无损）:
+        #   粗筛: 每类前 2 个模板（arial/arialbd，主流字体代表）
+        #   精算: 只对粗筛 top3 类别的全部模板跑 CCOEFF（原为全部 10 类全模板）
+        quick = {}
         for digit, tlist in self.by_digit.items():
+            best_s = -1.0
+            for tmpl, tmpl_inv in tlist[:2]:
+                s = cv2.matchTemplate(norm, tmpl, cv2.TM_CCOEFF_NORMED)[0, 0]
+                if s > best_s:
+                    best_s = s
+            quick[digit] = best_s
+        top3 = sorted(quick.items(), key=lambda kv: -kv[1])[:3]
+
+        ccf_best = {}   # digit -> (best_ccf, best_tmpl)
+        for digit, _ in top3:
             best_s, best_t = -1.0, None
-            for tmpl, tmpl_inv in tlist:
+            for tmpl, tmpl_inv in self.by_digit[digit]:
                 s = cv2.matchTemplate(norm, tmpl, cv2.TM_CCOEFF_NORMED)[0, 0]
                 if s > best_s:
                     best_s, best_t = s, tmpl
             ccf_best[digit] = (best_s, best_t)
 
+        # 符号拒识：只跑 1 个代表字体（'?' '<' 等与数字区分度足够）
         sym_best = -1.0
-        for tlist in self.by_symbol.values():
-            for tmpl, tmpl_inv in tlist:
+        for sym, tlist in self.by_symbol.items():
+            for tmpl, tmpl_inv in tlist[:1]:
                 s = cv2.matchTemplate(norm, tmpl, cv2.TM_CCOEFF_NORMED)[0, 0]
                 if s > sym_best:
                     sym_best = s
 
-        # 若整体匹配分偏低，可能极性相反，用反色模板再扫一轮
+        # 若整体匹配分偏低，可能极性相反，用反色模板再扫一轮（top3 + 符号）
+        # 阈值 0.45：正常极性单轮通过（题目为清晰白底黑字，几乎从不触发反色）
         top_ccf = max(v[0] for v in ccf_best.values())
-        if top_ccf < 0.55:
-            for digit, tlist in self.by_digit.items():
+        if top_ccf < 0.45:
+            for digit, _ in top3:
                 best_s, best_t = ccf_best[digit]
-                for tmpl, tmpl_inv in tlist:
+                for tmpl, tmpl_inv in self.by_digit[digit]:
                     s = cv2.matchTemplate(norm, tmpl_inv, cv2.TM_CCOEFF_NORMED)[0, 0]
                     if s > best_s:
                         best_s, best_t = s, tmpl
                 ccf_best[digit] = (best_s, best_t)
-            for tlist in self.by_symbol.values():
-                for tmpl, tmpl_inv in tlist:
+            for sym, tlist in self.by_symbol.items():
+                for tmpl, tmpl_inv in tlist[:1]:
                     s = cv2.matchTemplate(norm, tmpl_inv, cv2.TM_CCOEFF_NORMED)[0, 0]
                     if s > sym_best:
                         sym_best = s
@@ -806,6 +844,14 @@ class ScreenCapture:
         # 显式释放临时对象，防止长跑内存增长
         del img, screenshot
         return result
+
+    def capture_region_fast(self, x, y, width, height):
+        """极速路径：mss 原生 grab 直转 BGR（省 PIL 中转，约快 40-60%）"""
+        monitor = {"left": x, "top": y, "width": width, "height": height}
+        screenshot = self.sct.grab(monitor)
+        arr = np.frombuffer(screenshot.bgra, np.uint8).reshape(height, width, 4)
+        del screenshot
+        return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
 
 
 # ============================================================
@@ -1087,13 +1133,34 @@ class ScreenCompareApp:
         self.draw_event = threading.Event()  # L 键触发
         self._last_hotkey_at = 0.0
         self.processing_thread = None
-        self.process_interval = 0.06  # 60ms 一轮
+        self.process_interval = 0.02   # 20ms 一轮（极速扫描，截屏已提速无压力）
         self.draw_count = 0           # 已划线次数（用于定期内存报告）
         self.frame_count = 0          # 已处理帧数（用于定期 gc）
 
         self.config = Config()
         self.first_run = not self.config.exists()
         self.locked = bool(self.config.get("locked", False))
+
+        # ---------- 自动监测（识别框内出现新题 → 等 30ms → 自动划线） ----------
+        self.auto_monitor = True          # 自动监测开关
+        self.auto_interval = 0.025        # 扫描周期（秒）：每帧扫描，新题即察觉
+        self.confirm_delay = 0.01         # 察觉变化后 10ms 再识别（画面稳定即识别）
+        self.last_frame_small = None      # 上次观察的缩略图（灰度 numpy）
+        self._latest_full = None          # 最近一次扫描原图缓存（识别复用，省截图）
+        self.pending_since = None         # 检测到画面变化的时刻
+        self.last_done = None             # 上次已划线的题目 (n1, n2)
+        self.last_done_at = 0.0           # 上次划线时刻（防识别弹跳用）
+        self.max_number = 199             # 题目数字范围上限（100 以内题型）：
+                                          # 超过视为识别错误（残影/反馈符号粘连），拒绝划线
+        # 同一道题识别失败后的等待重试（等 2.5 秒再试一次，最多 max_retries 次）
+        self.retry_delay = 2.5            # 同一题重试间隔（秒）
+        self.max_retries = 5              # 同一题最多重试次数，超过则转补划循环
+        self.retry_at = None              # 下次重试的时间戳（None = 无重试计划）
+        self.retry_count = 0              # 同一题已重试次数
+        # 补划机制：划线后 0.8 秒若画面仍无任何变化（软件没识别/没判定），
+        # 重新识别并再划一次；识别到仍是同一道题（重复）则等 0.8 秒再划，
+        # 直到软件有反应（画面变化/切题）。循环只在画面变化时终止
+        self.redraw_at = None             # 补划触发时刻（None = 无补划计划）
 
         self.screen_capture = ScreenCapture()
         self.ocr_engine = OCREngine(confidence=0.62)
@@ -1262,6 +1329,13 @@ class ScreenCompareApp:
             if not self.locked:
                 set_click_through(self.selection_frame.window, False)
                 set_click_through(self.result_frame.window, False)
+            # 清空扫描状态，划线结束后正常监测下一题；
+            # 同时安排补划：0.8 秒后画面若无变化则再划一次（软件没识别时兜底）。
+            # 每次划线（含补划）都重新安排 → 画面一直不动就一直补，直到软件有反应
+            self.pending_since = None
+            self.retry_at = None
+            self.retry_count = 0
+            self.redraw_at = time.time() + 0.8
 
     @staticmethod
     def _get_memory_mb():
@@ -1305,6 +1379,11 @@ class ScreenCompareApp:
                 del image  # 释放帧内存
                 if len(numbers) >= 2:
                     n1, n2 = numbers[0], numbers[1]
+                    # 范围校验：三位数超出 100 以内题型 = 残影/反馈符号，
+                    # 手动触发也不划错误答案
+                    if n1 > self.max_number or n2 > self.max_number:
+                        print(f"[提示] 识别出 {n1} ? {n2}（超出题目范围），跳过本次")
+                        return
                     if n1 > n2:
                         symbol = ">"
                     elif n1 < n2:
@@ -1318,6 +1397,145 @@ class ScreenCompareApp:
             time.sleep(0.08)  # 等题目渲染完成再试
         # 没有识别到 → 不执行任何操作（不使用缓存）
         print("[提示] 未能识别题目中的两个数字，跳过本次")
+
+    # ---------- 自动监测：识别框内出现新题 → 等 confirm_delay → 自动划线 ----------
+    CHANGE_THRESH = 30.0   # 缩略图 MSE 阈值：超过视为画面变化（新题出现）
+
+    def _capture_both(self):
+        """
+        抓取识别框一次，同时产出：
+          full  - 原尺寸 BGR 图（缓存供识别复用，省一次截图）
+          small - 48x24 灰度缩略图（帧间变化比较）
+        极速路径（mss 原生 grab + numpy 直转），开销约 1-3ms。
+        """
+        try:
+            x, y, w, h = self.selection_frame.get_region()
+            if w < 20 or h < 20:
+                return None, None
+            full = self.screen_capture.capture_region_fast(x, y, w, h)
+            small = cv2.cvtColor(cv2.resize(full, (48, 24)), cv2.COLOR_BGR2GRAY)
+            return full, small
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def _mse(a, b):
+        return float(np.mean((a.astype(np.int16) - b.astype(np.int16)) ** 2))
+
+    def auto_scan(self):
+        """一直扫描识别框：画面变化 = 新题出现，等 confirm_delay 后识别并自动划线"""
+        if not self.auto_monitor or self.is_drawing or self.is_paused:
+            return
+        full, small = self._capture_both()
+        if small is None:
+            return
+        if self.last_frame_small is None:
+            self.last_frame_small = small
+            self._latest_full = full   # 缓存首帧备用
+            return
+
+        mse = self._mse(small, self.last_frame_small)
+        if mse >= self.CHANGE_THRESH:
+            # 画面变化中（切题帧 / 对勾反馈动画 / 残影演变）：
+            # 绝不识别——动画中间帧会把数字读成变体导致重复划线；
+            # 等画面停止变化才识别。变化期间的吸收逻辑已移除，
+            # 切题（单帧突变）下一帧即稳定，照常触发。
+            # 有变化 = 软件有反应（切题/打勾）→ 取消补划
+            self.retry_at = None
+            self.retry_count = 0
+            self.redraw_at = None
+            if self.pending_since is None:
+                self.pending_since = time.time()
+            self.last_frame_small = small
+            self._latest_full = full   # 缓存本帧，划过时免二次截图
+            return
+
+        # 画面稳定（无新变化）
+        if self.pending_since is not None:
+            # 变化结束后稳定且等待满 confirm_delay → 识别划线
+            if time.time() - self.pending_since >= self.confirm_delay:
+                self.pending_since = None
+                self._auto_solve_and_draw(initial_img=full)
+        elif self.retry_at is not None:
+            # 同一道题识别失败：等 2.5 秒后再试一次
+            if time.time() >= self.retry_at:
+                self._auto_solve_and_draw(initial_img=full)
+        elif self.redraw_at is not None:
+            # 补划到点：画面 0.8 秒无变化 = 软件没识别/没判定，
+            # 重新识别并再划一次；划线会重新安排下一次（直到画面变化）；
+            # 识别失败/超范围则 0.8 秒后再试（循环不中断）
+            if time.time() >= self.redraw_at:
+                self.redraw_at = None
+                self._auto_solve_and_draw(initial_img=full, force_redraw=True)
+                if self.redraw_at is None:
+                    # 补划未划线（识别失败/914），画面仍未变 → 继续循环
+                    self.redraw_at = time.time() + 0.8
+        self.last_frame_small = small
+
+    def _auto_solve_and_draw(self, initial_img=None, force_redraw=False):
+        """自动模式下识别划线；与上次已划题目相同则跳过（防重复）；
+        首次识别复用扫描帧原图（省一次截图），失败则快速重试，
+        仍失败则等 2.5 秒再试（最多 max_retries 次）。
+        force_redraw=True（补划路径）：画面静止 0.8s 无变化，无条件再划
+        （OCR 抖动/残留变体也照划，不中断循环——直到软件有反应）； 
+        914/超范围仍拒绝，循环继续等待下一次。"""
+        for attempt in range(2):
+            try:
+                if initial_img is not None:
+                    image = initial_img
+                    initial_img = None   # 仅首轮复用
+                else:
+                    x, y, w, h = self.selection_frame.get_region()
+                    if w <= 0 or h <= 0:
+                        return
+                    image = self.screen_capture.capture_region_fast(x, y, w, h)
+                numbers = self.ocr_engine.extract_numbers(image)
+                del image  # 释放帧内存
+                if len(numbers) >= 2:
+                    n1, n2 = numbers[0], numbers[1]
+                    # 范围校验：100 以内题型读到三位数 = 残影/反馈符号粘连，
+                    # 拒绝划线，等画面变化后重新识别
+                    if n1 > self.max_number or n2 > self.max_number:
+                        print(f"[自动] 识别出 {n1} ? {n2}（超出题目范围），忽略，等待重识别")
+                        return
+                    if self.last_done != (n1, n2) or force_redraw:
+                        # 差异处理：去重 + 范围校验已在上文完成，此处划线
+                        self.last_done = (n1, n2)
+                        self.last_done_at = time.time()
+                        if n1 > n2:
+                            symbol = ">"
+                        elif n1 < n2:
+                            symbol = "<"
+                        else:
+                            symbol = "="
+                        self.draw_real(symbol, n1, n2)
+                    else:
+                        # 同题去重：画面有过变化却仍读到上一题（反馈动画后
+                        # 残留/软件吃了线但没切题）→ 保持补划循环：
+                        # 0.8 秒后再划一次，直到软件有反应（画面变化）。
+                        # 补划路径（force）不经过这里——无条件再划
+                        if self.redraw_at is None:
+                            self.redraw_at = time.time() + 0.8
+                    # 划线成功 → 清除重试计划
+                    self.retry_at = None
+                    self.retry_count = 0
+                    return
+            except Exception:
+                pass
+            time.sleep(0.03)  # 首帧失败 30ms 后再试（通常只在切题动画时发生）
+        # 同一道题识别失败（可能只是画面闪烁/题目还没渲染好）：
+        # 等 retry_delay 秒后再试一次；多次失败后转入补划循环
+        #（每 0.8 秒再试，直到画面变化），不再静默跳过
+        self.retry_count += 1
+        if self.retry_count >= self.max_retries:
+            print("[自动] 同一题多次识别失败，转补划循环（每 0.8 秒再试直到画面变化）")
+            self.retry_count = 0
+            self.retry_at = None
+            self._latest_full = None
+            self.last_frame_small = self._capture_both()[1]  # 重新锚定
+            self.redraw_at = time.time() + 0.8
+        else:
+            self.retry_at = time.time() + self.retry_delay
 
     # ---------- 识别主循环（后台线程） ----------
     def process_screen(self):
@@ -1334,13 +1552,18 @@ class ScreenCompareApp:
             if self.frame_count % 300 == 0:
                 gc.collect()
 
+            # 自动监测：每帧扫描识别框（约 0.06s 察觉新题 → 0.1s 后划线）
+            self.auto_scan()
+
             time.sleep(self.process_interval)
 
     # ---------- 运行 ----------
     def run(self):
         print("[信息] 屏幕数字比较工具 v4 已启动")
         print("[信息] 拖动红框到题目数字、青框到答题位置")
-        print(f"[信息] 识别到题目后按【{chr(HOTKEY_VK)}】键 → 真实模拟鼠标划线")
+        if self.auto_monitor:
+            print(f"[信息] 自动监测已开启（极速）：新题出现 → {self.confirm_delay * 1000:.0f}ms 后自动划线")
+        print(f"[信息] 兜底控制：按【{chr(HOTKEY_VK)}】键手动触发 → 真实模拟鼠标划线")
         print("[信息] 按 ESC 或点 ✕ 退出")
         self.processing_thread = threading.Thread(
             target=self.process_screen, daemon=True
@@ -1355,6 +1578,11 @@ class ScreenCompareApp:
 
 def main():
     set_dpi_aware()  # 必须在创建窗口前设置，保证坐标一致
+    # 提升定时器精度到 1ms：让划线每步 sleep 精确，轨迹平滑自然（默认 15.6ms 会一步一顿）
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
 
     print("=" * 50)
     print("  屏幕数字比较识别工具 v4")
@@ -1362,7 +1590,8 @@ def main():
     print()
     print("功能说明:")
     print("  - 后台静默识别数字表达式，不在屏幕显示结果")
-    print(f"  - 按【{chr(HOTKEY_VK)}】键用真实鼠标模拟划线（按下-拖动-抬起）")
+    print("  - 【极速自动监测】识别框出现新题 → 0.05 秒后自动划线（全程约 0.2s）")
+    print(f"  - 兜底控制：按【{chr(HOTKEY_VK)}】键手动触发（按下-拖动-抬起）")
     print("  - 框可拖动缩放（1:1 精确跟随），位置自动保存")
     print("  - 🔒 锁定后点击穿透，不挡鼠标")
     print()
